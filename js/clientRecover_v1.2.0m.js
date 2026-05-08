@@ -510,6 +510,14 @@ const main = (event) => {
 
 	// Avoid unnecessary page reloads
 	const modmailDomains = new Set(['mod.reddit.com', 'www.reddit.com', window.location.host]);
+
+	// Shared navigation target for action links (archive, mute, highlight, etc.).
+	// Set immediately on click; consumed by the XHR interceptor inside NewXHR.send so
+	// that navigation fires *after* the action POST completes rather than before it.
+	// This prevents the list view from loading twice (once on our popstate, once again
+	// when the action's success handler triggers a store update and conversations refetch).
+	let pendingActionNav = null;
+
 	document.addEventListener('click', (e) => {
 		const anchor = e.target.closest('a');
 		if (!anchor || !anchor.href) return;
@@ -525,15 +533,23 @@ const main = (event) => {
 				const fullPath = url.pathname + url.search + url.hash;
 				console.log(`Redirecting link to internal route: ${fullPath}`);
 
-				// Deferred so that React's onClick handlers (e.g. archive, mute, highlight) run
-				// first in the current event loop tick before we push navigation state. Without
-				// this, the synchronous popstate dispatch updates the Redux store's
-				// platform.currentPage.urlParams.threadId to null *before* the action button's
-				// onClick fires, so the action POST never gets made.
+				// Signal to the XHR interceptor that this click has a pending navigation.
+				// For action links (archive, mute, etc.) the interceptor will consume this
+				// and fire navigation on XHR loadend instead. For pure navigation links
+				// (no action POST), the setTimeout fallback below handles it.
+				pendingActionNav = fullPath;
+
+				// Fallback: if the XHR interceptor did not consume pendingActionNav by the
+				// next tick (no action POST fired synchronously — pure nav link, or a
+				// Redux-Saga async dispatch), navigate now.
 				setTimeout(() => {
-					window.history.pushState(null, '', fullPath);
-					// Tell React to re-render the view
-					window.dispatchEvent(new PopStateEvent('popstate'));
+					if (pendingActionNav === fullPath) {
+						pendingActionNav = null;
+						window.history.pushState(null, '', fullPath);
+						// Tell React to re-render the view
+						window.dispatchEvent(new PopStateEvent('popstate'));
+					}
+					// else: XHR interceptor consumed it; navigation fires on loadend
 				}, 0);
 			}
 		}
@@ -933,6 +949,10 @@ const main = (event) => {
 		"/api/mod/conversations/archive", "/api/mod/conversations/highlight"
 	]);
 
+	// Matches single-conversation action endpoints: POST /api/mod/conversations/{id}/{action}
+	// e.g. /api/mod/conversations/3ehif6/archive  (distinct from bulk /api/mod/conversations/archive)
+	const singleConvActionPattern = /^\/api\/mod\/conversations\/[^/]+\/[^/]+$/;
+
 	function NewXHR() {
 		const xhr = new OldXHR();
 
@@ -952,6 +972,21 @@ const main = (event) => {
 				} else if (bulkActionURLs.has(url.pathname)) {
 					createFakeXHR(this, () => bulkEndpointBugfix(data, this._url));
 					return;
+				}
+
+				// If this is a single-conversation action POST (archive, mute, highlight,
+				// etc.) and the click handler set a pending navigation, consume it here
+				// and fire navigation on loadend — after the action has actually been
+				// applied. This avoids the double load cycle where the list would
+				// otherwise initialize once from our popstate and again when the action's
+				// success handler triggers a conversations refetch.
+				if (singleConvActionPattern.test(url.pathname) && pendingActionNav) {
+					const navTarget = pendingActionNav;
+					pendingActionNav = null; // prevent setTimeout fallback from also navigating
+					this.addEventListener('loadend', () => {
+						window.history.pushState(null, '', navTarget);
+						window.dispatchEvent(new PopStateEvent('popstate'));
+					});
 				}
 			}
 			return send.apply(this, arguments);
