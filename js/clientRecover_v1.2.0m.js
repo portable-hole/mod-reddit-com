@@ -953,11 +953,35 @@ const main = (event) => {
 	// e.g. /api/mod/conversations/3ehif6/archive  (distinct from bulk /api/mod/conversations/archive)
 	const singleConvActionPattern = /^\/api\/mod\/conversations\/[^/]+\/[^/]+$/;
 
+	// One-shot response cache for conversations list GETs, keyed by "state" param
+	// (e.g. "all", "inbox"). Populated by the action-POST loadend handler after
+	// the action completes so React gets an instant response with no loading flash.
+	// Consumed on the first matching GET and then discarded.
+	const convListCache = new Map(); // state => JSON string
+
 	function NewXHR() {
 		const xhr = new OldXHR();
 
 		const send = xhr.send;
 		xhr.send = function (data) {
+			// Intercept GET requests for the conversations list and serve from our
+			// pre-fetched cache if available, eliminating React's loading state.
+			if (this._url && this._method === "GET") {
+				try {
+					const u = new URL(this._url);
+					if (u.pathname === '/api/mod/conversations') {
+						const state = u.searchParams.get('state') ?? 'all';
+						const cached = convListCache.get(state);
+						if (cached) {
+							convListCache.delete(state); // one-shot
+							// cached may be a Promise (still in-flight) or a string (resolved)
+							createFakeXHR(this, () => Promise.resolve(cached).then(v => v ?? '{}'));
+							return;
+						}
+					}
+				} catch (e) { /* non-URL _url, ignore */ }
+			}
+
 			if (this._url && this._method === "POST") {
 				if (this._url === "/refreshproxy?redditWebClient=modmail") {
 					createFakeXHR(this, refreshProxyResponse);
@@ -974,28 +998,50 @@ const main = (event) => {
 					return;
 				}
 
-				// If this is a single-conversation action POST (archive, mute, highlight,
-				// etc.) and the click handler set a pending navigation, consume it here.
-				// We defer the URL/navigation update to loadend so it happens after the
-				// action has been applied, but we check the Redux store at that point:
-				// React's saga dispatches its own internal navigation on the earlier
-				// 'load' event (before 'loadend'), so by the time loadend fires the
-				// store's currentPage has usually already moved to the list view.
-				// If it has, we only need to sync the URL bar — dispatching another
-				// popstate on top would cause a second navigation/loading cycle (the
-				// "Please wait..." flash the user sees). If React hasn't navigated yet
-				// (e.g. for non-navigating actions), we fall back to the full popstate.
+				// For single-conversation action POSTs (archive, mute, highlight, etc.):
+				// 1. Consume pendingActionNav so the setTimeout fallback doesn't fire.
+				// 2. On loadend, work out which conversations list React is about to
+				//    request (from the Redux store's current page state), pre-fetch it
+				//    ourselves, store the result in xhrResponseCache, then fire navigation.
+				//    When React's GET XHR fires milliseconds later it gets an instant
+				//    cache hit above and never enters its loading state.
 				if (singleConvActionPattern.test(url.pathname) && pendingActionNav) {
 					const navTarget = pendingActionNav;
 					pendingActionNav = null; // prevent setTimeout fallback from also navigating
-					this.addEventListener('loadend', () => {
+					this.addEventListener('loadend', async () => {
+						// Determine the list state React will request after navigation.
+						const navSegments = navTarget.split('/').filter(Boolean);
+						const navState = navSegments[1] || 'all';
+
+						// Pre-fetch the conversations list concurrently with navigation so
+						// React can reconcile the data without showing a loading spinner.
+						const prefetchPromise = fetch(
+							`https://oauth.reddit.com/api/mod/conversations?sort=recent&state=${navState}&redditWebClient=modmail`,
+							{ method: "GET", headers: { "Authorization": "Bearer " + await getToken() } }
+						).then(r => r.ok ? r.text() : null).catch(() => null);
+
+						// Store the in-flight promise so the XHR interceptor can await it.
+						// Keyed by state so GET-interceptor can match without knowing the full URL.
+						convListCache.set(navState, prefetchPromise);
+
+						// Sync URL bar. React's saga already navigated internally on the
+						// XHR 'load' event (before loadend); we just need the address bar to match.
 						const reactPage = window.store?.getState()?.platform?.currentPage;
 						if (reactPage && !reactPage.urlParams?.threadId) {
-							// React's saga already navigated away from the conversation —
-							// just sync the address bar to wherever React landed.
 							window.history.pushState(null, '', reactPage.url);
 						} else {
-							// React hasn't navigated on its own; do it ourselves.
+							window.history.pushState(null, '', navTarget);
+							window.dispatchEvent(new PopStateEvent('popstate'));
+						}
+					});
+				}
+
+						// Sync URL bar. React's saga already navigated internally on
+						// the XHR 'load' event; we just need the address bar to match.
+						const reactPage = window.store?.getState()?.platform?.currentPage;
+						if (reactPage && !reactPage.urlParams?.threadId) {
+							window.history.pushState(null, '', reactPage.url);
+						} else {
 							window.history.pushState(null, '', navTarget);
 							window.dispatchEvent(new PopStateEvent('popstate'));
 						}
