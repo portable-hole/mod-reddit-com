@@ -975,17 +975,30 @@ const main = (event) => {
 				}
 
 				// If this is a single-conversation action POST (archive, mute, highlight,
-				// etc.) and the click handler set a pending navigation, consume it here
-				// and fire navigation on loadend — after the action has actually been
-				// applied. This avoids the double load cycle where the list would
-				// otherwise initialize once from our popstate and again when the action's
-				// success handler triggers a conversations refetch.
+				// etc.) and the click handler set a pending navigation, consume it here.
+				// We defer the URL/navigation update to loadend so it happens after the
+				// action has been applied, but we check the Redux store at that point:
+				// React's saga dispatches its own internal navigation on the earlier
+				// 'load' event (before 'loadend'), so by the time loadend fires the
+				// store's currentPage has usually already moved to the list view.
+				// If it has, we only need to sync the URL bar — dispatching another
+				// popstate on top would cause a second navigation/loading cycle (the
+				// "Please wait..." flash the user sees). If React hasn't navigated yet
+				// (e.g. for non-navigating actions), we fall back to the full popstate.
 				if (singleConvActionPattern.test(url.pathname) && pendingActionNav) {
 					const navTarget = pendingActionNav;
 					pendingActionNav = null; // prevent setTimeout fallback from also navigating
 					this.addEventListener('loadend', () => {
-						window.history.pushState(null, '', navTarget);
-						window.dispatchEvent(new PopStateEvent('popstate'));
+						const reactPage = window.store?.getState()?.platform?.currentPage;
+						if (reactPage && !reactPage.urlParams?.threadId) {
+							// React's saga already navigated away from the conversation —
+							// just sync the address bar to wherever React landed.
+							window.history.pushState(null, '', reactPage.url);
+						} else {
+							// React hasn't navigated on its own; do it ourselves.
+							window.history.pushState(null, '', navTarget);
+							window.dispatchEvent(new PopStateEvent('popstate'));
+						}
 					});
 				}
 			}
