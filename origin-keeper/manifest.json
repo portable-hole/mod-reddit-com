@@ -1,0 +1,21 @@
+{
+    "manifest_version": 2,
+    "name": "Modmail Origin Keeper",
+    "version": "1.0.0",
+    "description": "Strips the server redirect from mod.reddit.com/mail/* so the 'mod.reddit.com revived' userscript can rebuild old modmail at its real origin (enables Toolbox and Stylus hooks).",
+    "browser_specific_settings": {
+        "gecko": {
+            "id": "modmail-origin-keeper@portable-hole",
+            "strict_min_version": "115.0"
+        }
+    },
+    "permissions": [
+        "webRequest",
+        "webRequestBlocking",
+        "https://mod.reddit.com/*"
+    ],
+    "background": {
+        "scripts": ["background.js"],
+        "persistent": true
+    }
+}
